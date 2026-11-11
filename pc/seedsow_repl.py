@@ -14,6 +14,8 @@ Commands:
   sdk-get [name]     Get a service handle via SDK's GetServiceHandle
   test-ipc [name]    Get handle + send CMIF IPC test packet
   test-svc22         Direct SVC #0x22 test (bypass SDK wrapper)
+  test-tipc          TIPC format test + memory attribute check
+  clean-test         Comprehensive IPC test (clean bytes, handle cleanup)
   fsp-init <handle>  Initialize fsp-srv with SetCurrentProcess
   fsp-probe <handle> Probe fsp-srv IPC commands
   full               Full chain: get handle → init → probe
@@ -332,16 +334,47 @@ class SeedREPL:
                 print(f"[!] Error: {e}")
 
 
-def build_cmif_packet(cmd_id, input_data=b''):
-    pkt = bytearray(64)
-    struct.pack_into('<I', pkt, 0, 0x00000004)
-    data_words = (32 + len(input_data) + 3) // 4
+def build_cmif_packet(cmd_id, input_data=b'', sfci_at_16=True):
+    """Build CMIF packet. sfci_at_16=True (standard aligned), False (SFCI at offset 8)."""
+    if sfci_at_16:
+        # Standard: 8B padding for 16-byte alignment, then SFCI header
+        pkt = bytearray(64)
+        struct.pack_into('<I', pkt, 0, 0x00000004)  # type=4 (Request)
+        data_words = (24 + len(input_data) + 3) // 4  # padding(8) + SFCI(16) + input
+        struct.pack_into('<I', pkt, 4, data_words)
+        # offset 8-15: padding (zeros)
+        pkt[16:20] = b'SFCI'
+        # offset 20-23: version = 0
+        struct.pack_into('<I', pkt, 24, cmd_id)
+        # offset 28-31: reserved = 0
+        if input_data:
+            pkt[32:32+len(input_data)] = input_data
+        return bytes(pkt[:32 + len(input_data)])
+    else:
+        # Alt: SFCI immediately after header (no padding)
+        pkt = bytearray(64)
+        struct.pack_into('<I', pkt, 0, 0x00000004)
+        data_words = (16 + len(input_data) + 3) // 4  # SFCI(16) + input
+        struct.pack_into('<I', pkt, 4, data_words)
+        pkt[8:12] = b'SFCI'
+        # offset 12-15: version = 0
+        struct.pack_into('<I', pkt, 16, cmd_id)
+        # offset 20-23: reserved = 0
+        if input_data:
+            pkt[24:24+len(input_data)] = input_data
+        return bytes(pkt[:24 + len(input_data)])
+
+
+def build_tipc_packet(cmd_id, input_data=b''):
+    """TIPC format: type = 0x10 + cmd_id in HIPC header, raw data (no SFCI)."""
+    tipc_type = 0x10 + cmd_id
+    data_words = (len(input_data) + 3) // 4
+    pkt = bytearray(8 + len(input_data))
+    struct.pack_into('<I', pkt, 0, tipc_type & 0xFFFF)
     struct.pack_into('<I', pkt, 4, data_words)
-    pkt[16:20] = b'SFCI'
-    struct.pack_into('<I', pkt, 24, cmd_id)
     if input_data:
-        pkt[32:32+len(input_data)] = input_data
-    return bytes(pkt[:32 + len(input_data)])
+        pkt[8:8+len(input_data)] = input_data
+    return bytes(pkt)
 
 
 def main():
@@ -385,6 +418,261 @@ def main():
 
             print("\n[B] SDK wrapper:")
             repl.send_ipc(handle, pkt, "IsSdCardAccessible")
+
+    elif command == 'test-tipc':
+        handle = repl.sdk_get_service('fsp-srv')
+        if not handle:
+            print("[-] Could not get fsp-srv handle")
+        else:
+            print(f"\n[+] Got fsp-srv handle: 0x{handle:x}")
+
+            # ── Test A: TIPC via TLS + SVC #0x21 (same path SM uses) ──
+            print("\n=== [A] TIPC via TLS + SVC #0x21 (the SM-proven path) ===")
+            pkt = build_tipc_packet(1001)
+            lua_pkt = bytes_to_lua_str(pkt)
+            memcpy = repl.main_base + OFF_MEMCPY_PLT
+            svc21 = repl.sdk_base + OFF_SVC_SEND
+            try:
+                resp = repl.cmd(
+                    f'local src = h.alloc(256) '
+                    f'for i=0,248,8 do h.poke(src+i, 0) end '
+                    f'h.write_bytes(src, {lua_pkt}) '
+                    f'_G.tls_dst = h.alloc(256) '
+                    f'for i=0,248,8 do h.poke(tls_dst+i, 0) end '
+                    f'local rc1 = h.call_deep(0x{memcpy:x}, tls, src, 256, 0, 0) '
+                    f'local rc2 = h.call_deep(0x{svc21:x}, {handle}, 0, 0, 0, 0) '
+                    f'local rc3 = h.call_deep(0x{memcpy:x}, tls_dst, tls, 256, 0, 0) '
+                    f'h.free(src) '
+                    f'return string.format("svc21=0x%x", rc2)',
+                    timeout=30
+                )
+                print(f"  SVC #0x21 result: {resp}")
+                if "0x0" == resp.split("=")[-1].strip():
+                    print("  ** SUCCESS — TLS responded! **")
+                repl._dump_heap_response('tls_dst', 8)
+                repl.cmd('h.free(tls_dst)')
+            except Exception as e:
+                print(f"  [!] Error: {e}")
+
+            # ── Test B: TIPC via heap + SVC #0x22 ──
+            print("\n=== [B] TIPC via heap + SVC #0x22 ===")
+            try:
+                repl.send_ipc_direct_svc22(handle, pkt, "TIPC IsSdCardAccessible")
+            except Exception as e:
+                print(f"  [!] Error: {e}")
+
+            # ── Test C: CMIF via heap + SVC #0x22 (known-bad baseline) ──
+            print("\n=== [C] CMIF via heap + SVC #0x22 (baseline) ===")
+            try:
+                pkt_cmif = build_cmif_packet(1001)
+                repl.send_ipc_direct_svc22(handle, pkt_cmif, "CMIF IsSdCardAccessible")
+            except Exception as e:
+                print(f"  [!] Error: {e}")
+
+    elif command == 'test-atomic':
+        memcpy = repl.main_base + OFF_MEMCPY_PLT
+        svc21 = repl.sdk_base + OFF_SVC_SEND
+
+        # ── Step 1: prove TLS race — check if memcpy survives ──
+        print("\n=== TLS race detection ===")
+        sm_tipc = build_tipc_packet(0)  # TIPC cmd=0 (Initialize) to SM
+        lua_sm = bytes_to_lua_str(sm_tipc)
+        try:
+            resp = repl.cmd(
+                f'local src = h.alloc(256) for i=0,248,8 do h.poke(src+i,0) end '
+                f'h.write_bytes(src, {lua_sm}) '
+                f'_G.snap1 = h.alloc(256) for i=0,248,8 do h.poke(snap1+i,0) end '
+                f'_G.snap2 = h.alloc(256) for i=0,248,8 do h.poke(snap2+i,0) end '
+                f'local rc1 = h.call_deep(0x{memcpy:x}, tls, src, 256, 0, 0) '
+                f'local rc2 = h.call_deep(0x{memcpy:x}, snap1, tls, 256, 0, 0) '
+                f'return string.format("wrote=0x%x snapped=0x%x", rc1, rc2)',
+                timeout=30
+            )
+            print(f"  {resp}")
+            print("  TLS after memcpy (before SVC):")
+            repl._dump_heap_response('snap1', 4)
+
+            resp = repl.cmd(
+                f'local rc3 = h.call_deep(0x{svc21:x}, 0x{repl.sm_handle_val:x}, 0, 0, 0, 0) '
+                f'local rc4 = h.call_deep(0x{memcpy:x}, snap2, tls, 256, 0, 0) '
+                f'h.free(src) '
+                f'return string.format("svc=0x%x", rc3)',
+                timeout=30
+            )
+            print(f"  SVC result: {resp}")
+            print("  TLS after SVC:")
+            repl._dump_heap_response('snap2', 4)
+            repl.cmd('h.free(snap1) h.free(snap2)')
+        except Exception as e:
+            print(f"  [!] {e}")
+
+        # ── Step 2: atomic run_chain with CLEAN bytes (Lua string, no poke corruption) ──
+        print("\n=== Atomic via run_chain + clean string source ===")
+        sm_tipc_bytes = build_tipc_packet(0)
+        lua_hdr = bytes_to_lua_str(sm_tipc_bytes)
+        try:
+            resp = repl.cmd(
+                f'_G.pkt_str = {lua_hdr} .. string.rep("\\0", 248) '
+                f'_G.pkt_addr = h.str_addr(pkt_str) + 24 '
+                f'_G.chain_dst = h.alloc(256) for i=0,248,8 do h.poke(chain_dst+i,0) end '
+                f'return string.format("pkt_addr=0x%x", pkt_addr)',
+                timeout=30
+            )
+            print(f"  {resp}")
+
+            print("  Verifying string bytes are clean:")
+            repl._dump_heap_response('pkt_addr', 2)
+
+            resp = repl.cmd(
+                f'h.run_chain(function(E) '
+                f'  E:call3(0x{memcpy:x}, tls, pkt_addr, 256) '
+                f'  E:call3(0x{svc21:x}, 0x{repl.sm_handle_val:x}, 0, 0) '
+                f'  E:call3(0x{memcpy:x}, chain_dst, tls, 256) '
+                f'end) '
+                f'return "chain done"',
+                timeout=30
+            )
+            print(f"  {resp}")
+            print("  TLS response after atomic SM TIPC:")
+            repl._dump_heap_response('chain_dst', 4)
+            repl.cmd('h.free(chain_dst)')
+        except Exception as e:
+            print(f"  [!] {e}")
+
+        # ── Step 3: same with fsp-srv ──
+        print("\n=== Atomic fsp-srv TIPC (clean source) ===")
+        fsp_tipc = build_tipc_packet(1001)
+        lua_fsp_hdr = bytes_to_lua_str(fsp_tipc)
+        try:
+            get_svc = repl.sdk_base + OFF_GET_SERVICE_HANDLE
+            resp = repl.cmd(
+                f'local out = h.alloc(32) h.poke(out,0) '
+                f'local nm = h.alloc(16) h.write_bytes(nm, string.char(102,115,112,45,115,114,118,0)) '
+                f'local rc = h.call_deep(0x{get_svc:x}, out, nm, 7, 0, 0) '
+                f'_G.fsp_h = h.peek(out) '
+                f'h.free(out) h.free(nm) '
+                f'return string.format("rc=0x%x handle=0x%x", rc, fsp_h)',
+                timeout=30
+            )
+            print(f"  GetService: {resp}")
+
+            resp = repl.cmd(
+                f'_G.fsp_pkt = {lua_fsp_hdr} .. string.rep("\\0", 248) '
+                f'_G.fsp_src = h.str_addr(fsp_pkt) + 24 '
+                f'_G.fsp_dst = h.alloc(256) for i=0,248,8 do h.poke(fsp_dst+i,0) end '
+                f'h.run_chain(function(E) '
+                f'  E:call3(0x{memcpy:x}, tls, fsp_src, 256) '
+                f'  E:call3(0x{svc21:x}, fsp_h, 0, 0) '
+                f'  E:call3(0x{memcpy:x}, fsp_dst, tls, 256) '
+                f'end) '
+                f'return "chain done"',
+                timeout=30
+            )
+            print(f"  {resp}")
+            print("  fsp-srv response:")
+            repl._dump_heap_response('fsp_dst', 4)
+            repl.cmd('h.free(fsp_dst)')
+        except Exception as e:
+            print(f"  [!] {e}")
+
+    elif command == 'clean-test':
+        memcpy = repl.main_base + OFF_MEMCPY_PLT
+        svc21 = repl.sdk_base + OFF_SVC_SEND
+        svc22 = repl.sdk_base + OFF_SVC_SEND_USERBUF
+        sdk_wrap = repl.sdk_base + OFF_SDK_SEND_WRAPPER
+        get_svc = repl.sdk_base + OFF_GET_SERVICE_HANDLE
+        svc_close = repl.sdk_base + OFF_SVC_CLOSE
+
+        def send_clean_tls(handle, pkt_bytes, label):
+            """Send IPC via clean Lua string → memcpy → TLS → SVC #0x21, all in one expression."""
+            lua_hdr = bytes_to_lua_str(pkt_bytes)
+            try:
+                resp = repl.cmd(
+                    f'local ps = {lua_hdr} .. string.rep("\\0", {256 - len(pkt_bytes)}) '
+                    f'local pa = h.str_addr(ps) + 24 '
+                    f'_G.rd = h.alloc(256) for i=0,248,8 do h.poke(rd+i,0) end '
+                    f'h.call_deep(0x{memcpy:x}, tls, pa, 256, 0, 0) '
+                    f'local rc = h.call_deep(0x{sdk_wrap:x}, {handle}, tls, 256, 0, 0) '
+                    f'h.call_deep(0x{memcpy:x}, rd, tls, 256, 0, 0) '
+                    f'return string.format("rc=0x%x", rc)',
+                    timeout=30
+                )
+                print(f"  [{label}] {resp}")
+                # read response as raw bytes
+                r2 = repl.cmd(
+                    f'local s=string.rep("\\0",64) local d=h.str_addr(s)+24 '
+                    f'h.call_deep(0x{memcpy:x}, d, rd, 64, 0, 0) '
+                    f'local b={{}} for i=1,40 do b[#b+1]=string.format("%02x",string.byte(s,i)) end '
+                    f'h.free(rd) return table.concat(b," ")'
+                )
+                print(f"    resp: {r2}")
+                return resp
+            except Exception as e:
+                print(f"  [{label}] Error: {e}")
+                return None
+
+        def send_clean_svc22(handle, pkt_bytes, label):
+            """Send IPC via clean Lua string → memcpy → page-aligned heap → SVC #0x22."""
+            lua_hdr = bytes_to_lua_str(pkt_bytes)
+            try:
+                resp = repl.cmd(
+                    f'local ps = {lua_hdr} .. string.rep("\\0", {4096 - len(pkt_bytes)}) '
+                    f'local pa = h.str_addr(ps) + 24 '
+                    f'local raw = h.alloc(0x2000) '
+                    f'local ab = raw if raw%0x1000~=0 then ab=raw+0x1000-(raw%0x1000) end '
+                    f'h.call_deep(0x{memcpy:x}, ab, pa, 4096, 0, 0) '
+                    f'local rc = h.call_deep(0x{svc22:x}, ab, 4096, {handle}, 0, 0) '
+                    f'_G.rd2 = h.alloc(256) for i=0,248,8 do h.poke(rd2+i,0) end '
+                    f'h.call_deep(0x{memcpy:x}, rd2, ab, 64, 0, 0) '
+                    f'h.free(raw) '
+                    f'return string.format("rc=0x%x", rc)',
+                    timeout=30
+                )
+                print(f"  [{label}] {resp}")
+                r2 = repl.cmd(
+                    f'local s=string.rep("\\0",64) local d=h.str_addr(s)+24 '
+                    f'h.call_deep(0x{memcpy:x}, d, rd2, 64, 0, 0) '
+                    f'local b={{}} for i=1,40 do b[#b+1]=string.format("%02x",string.byte(s,i)) end '
+                    f'h.free(rd2) return table.concat(b," ")'
+                )
+                print(f"    resp: {r2}")
+                return resp
+            except Exception as e:
+                print(f"  [{label}] Error: {e}")
+                return None
+
+        # ── Get fsp-srv handle (SDK function, known working) ──
+        print("\n=== Step 1: Get fsp-srv handle ===")
+        handle = repl.sdk_get_service('fsp-srv')
+        if not handle:
+            print("[-] GetServiceHandle failed! SM might be broken. Restart server.")
+        else:
+            print(f"[+] fsp-srv handle: 0x{handle:x}")
+
+            # ── Test all IPC formats via TLS + SVC #0x21 ──
+            print("\n=== Step 2: TLS + SDK wrapper (→ SVC #0x21) tests ===")
+            formats = [
+                ("CMIF aligned (SFCI@16)", build_cmif_packet(1001, sfci_at_16=True)),
+                ("CMIF compact (SFCI@8)",  build_cmif_packet(1001, sfci_at_16=False)),
+                ("TIPC cmd=1001",          build_tipc_packet(1001)),
+            ]
+            for label, pkt in formats:
+                print(f"\n  Packet ({len(pkt)}B): {pkt.hex()}")
+                send_clean_tls(handle, pkt, label)
+
+            # ── Test via SVC #0x22 ──
+            print("\n=== Step 3: Direct SVC #0x22 tests ===")
+            for label, pkt in formats:
+                print(f"\n  Packet ({len(pkt)}B): {pkt.hex()}")
+                send_clean_svc22(handle, pkt, label)
+
+            # ── Clean up handle ──
+            print("\n=== Step 4: Cleanup ===")
+            resp = repl.cmd(
+                f'local rc = h.call_deep(0x{svc_close:x}, 0x{handle:x}, 0, 0, 0, 0) '
+                f'return string.format("close(fsp-srv)=0x%x", rc)'
+            )
+            print(f"  {resp}")
 
     elif command == 'fsp-init':
         fsp_handle = int(service, 0)

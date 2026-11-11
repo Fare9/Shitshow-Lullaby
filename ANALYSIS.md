@@ -203,19 +203,57 @@ The REPL provides remote access. From PC, the Python script sends Lua code that 
 
 - **SM handle confirmed** at SDK+0xb5459c, value typically 0x101FE, init_count=24
 - **SDK's GetServiceHandle** works reliably via `call_deep(SDK+0x14cc90, out, name, len)` — returns valid fsp-srv handles every time
-- **Handle validation confirmed** — SVC returns desc=123 (not desc=114 InvalidHandle), proving the handle exists
+- **Handle validity confirmed** — handles can be closed with svcCloseHandle (rc=0), proving they exist in the kernel handle table
 - **Switch TIPC format discovered** via Binary Ninja: SM uses type = `0x10 + cmd_id` (not old type=0xF)
-- **TLS race condition solved** — combining memcpy→TLS + SVC + memcpy←TLS in a single Lua expression prevents game thread interference
+- **SVC stub addresses verified** on hardware by reading code bytes: SVC #0x21 at 0x168c4c, SVC #0x22 at 0x168c54
 
-### What Was Tried and Failed
+### Key Discoveries
 
-| Attempt | Method | Result |
-|---------|--------|--------|
-| CMIF via SVC #0x21 (TLS) | memcpy packet to TLS, svcSendSyncRequest | **0xF601** (desc=123). Packet in response was our SFCI unchanged. Kernel rejects CMIF type=4 via SVC #0x21 on this firmware |
-| CMIF via SDK wrapper (sub_14bb90) | SDK dispatches to SVC #0x22 for heap buffers | **0x25a0b** (SDK's transform of 0xF601). Same transport rejection |
-| CMIF via direct SVC #0x22 | Page-aligned malloc buffer, direct SVC call | **0xF601**. Kernel still rejects |
-| CMIF data word count = 8 | Match civswitch's `ceil((32+0)/4)` | Same error |
-| CMIF data word count = 10 | Original calculation | Same error |
+#### Type Tag Corruption (poke/write_bytes)
+
+`n2h.poke(addr, val)` writes a 16-byte TValue (8B value + 4B type tag 0x03 + 4B padding), corrupting bytes addr+8..addr+15. `write_bytes`/`wstr` iterates via poke in 4-byte chunks, so every chunk corrupts its +8..+11 bytes (only the LAST chunk's tag persists). This made all early IPC packets corrupt — discovered by dumping buffer bytes.
+
+**Fix:** Build IPC packet as a Lua string (`string.char(...)`) and memcpy from the TString data region (`str_addr(s) + 24`). Zero type tag pollution. All subsequent tests use this clean method.
+
+#### TLS Race Condition
+
+Between separate `call_deep` calls (memcpy→TLS, then SVC#21), the game's own IPC activity can overwrite TLS. Confirmed by snapshotting TLS after memcpy vs after SVC — TLS showed game's SFCO response, not our packet.
+
+**Fix:** Run memcpy→TLS + SVC + memcpy←response in a single Lua expression or `run_chain` for atomic execution. Clean-test uses single-expression approach.
+
+#### SVC #0x22 Buffer Requirements
+
+Kernel requires **page-aligned buffer** (0x1000) and **page-aligned size** (0x1000) for SVC #0x22. Size=256 returns 0xca01 (InvalidSize, desc=101). Fixed by allocating 0x2000 and aligning to 0x1000 boundary.
+
+#### SM Handle is Shared
+
+Closing the SM handle (0x101FE) via svcCloseHandle CRASHES the game. The SM session is shared by the game — never close it. Only close handles we ourselves obtained from GetServiceHandle.
+
+### Definitive IPC Test Results (clean-test)
+
+The `clean-test` command performs a comprehensive, controlled IPC test:
+- Clean byte source (Lua string → memcpy, no poke/write_bytes)
+- Fresh fsp-srv handle from GetServiceHandle
+- Three IPC formats × two SVC paths = 6 tests
+- Handle cleanup (svcCloseHandle) after all tests
+
+#### Formats tested:
+
+| Format | Word 0 | Word 1 | SFCI offset | Notes |
+|--------|--------|--------|-------------|-------|
+| CMIF aligned | 0x00000004 | 0x00000006 | 16 | Standard: 8B padding for 16-byte SFCI alignment |
+| CMIF compact | 0x00000004 | 0x00000004 | 8 | No padding: SFCI immediately after HIPC header |
+| TIPC | 0x000003F9 | 0x00000000 | N/A | type = 0x10 + 1001 = 0x3F9, raw data, no SFCI |
+
+#### Results:
+
+| Format | SVC #0x21 (TLS+SDK wrapper) | SVC #0x22 (page-aligned heap) |
+|--------|---------------------------|-------------------------------|
+| CMIF aligned (SFCI@16) | **0x25a0b** (= SDK's 0xF601) | **0xF601** |
+| CMIF compact (SFCI@8) | **0x25a0b** (= SDK's 0xF601) | **0xF601** |
+| TIPC (cmd=1001) | **0x25a0b** (= SDK's 0xF601) | **0xF601** |
+
+**All 6 tests return 0xF601 (kernel module=1, desc=123, InvalidState).** Response buffers contain original packet bytes unchanged — the kernel rejects before forwarding to fsp-srv.
 
 ### Binary Ninja Analysis
 
@@ -229,55 +267,80 @@ Key findings from SDK NSO disassembly:
 
 ## Current Blocker
 
-**Both SVC #0x21 and SVC #0x22 return 0xF601 for CMIF (type=4) packets sent to fsp-srv.**
+**Error 0xF601 (InvalidState) on ALL IPC formats to fsp-srv.**
 
-The kernel rejects the message at the transport level — the response buffer shows the original packet unchanged (no processing occurred).
+The kernel rejects the message before it reaches the fsp-srv service process. Response buffers are unchanged (clean bytes confirmed). The handle is valid (close succeeds). GetServiceHandle itself works (it internally uses SVC #0x21 TIPC to SM).
 
-The fsp-srv handle is valid (confirmed by error code). The issue is specifically with **sending CMIF-format IPC messages** to it.
+### Root Cause Analysis
+
+0xF601 = Horizon kernel error, module 1, description 123 (InvalidState). The kernel returns this from svcSendSyncRequest / svcSendSyncRequestWithUserBuffer when:
+
+1. **Session not fully connected** — server hasn't called svcAcceptSession on its port end
+2. **Server closed its end** — fsp-srv rejected the session after SM created the pair
+3. **IPC message header malformed** — kernel can't parse the HIPC structure
+
+Since we tested three completely different header formats (CMIF aligned, CMIF compact, TIPC) and all fail identically, option 3 is unlikely. **The session itself is in an invalid state.**
+
+### Why the session might be broken
+
+When we call GetServiceHandle("fsp-srv"), SM creates a session pair and returns our client handle. But fsp-srv must **accept** the session on its server port. If fsp-srv:
+- Has hit its maximum session count (game already holds sessions)
+- Rejects based on process-level checks
+- Is slow to accept (race between SM return and our first IPC)
+
+...the client handle exists (closeable) but the session is "pending" or "disconnected", and the kernel returns InvalidState.
 
 ---
 
-## Hypotheses and Next Steps
+## Hypotheses and Next Steps (Prioritized)
 
-### Hypothesis A: Memory Attributes
+### Hypothesis A: Use the Game's Existing fsp-srv Session (Most Promising)
 
-`malloc` returns memory from nn::mem's allocator. civswitch uses `nn::os::AllocateMemoryPages` (verified via `svcQueryMemory` to be type=5, permissions=3, no special attributes). Our malloc might return memory with different kernel attributes that SVC #0x22 rejects.
+The game already has an initialized, working fsp-srv session (it loads saves, processes assets, etc.). Instead of obtaining a new session that might be rejected, **find and reuse the game's existing fsp-srv handle**.
 
-**Test:** Call `svcQueryMemory` on the malloc'd IPC buffer and compare attributes to TLS memory. Or find the SDK's page allocator and use it instead.
+Approaches:
+1. **Scan BSS/data** for stored handle values — the SDK stores IFS* client handles in globals
+2. **Handle brute-force** — iterate handles 1-64, for each: try svcGetInfo or check handle type via kernel
+3. **Trace xrefs** in BN — follow nn::fs initialization to find where the fsp-srv handle is stored
+4. **Read the game's IPC client objects** in memory — SDK IPC client structs contain the handle at a known offset
 
-### Hypothesis B: Session Type Mismatch
+### Hypothesis B: SetCurrentProcess Initialization
 
-The fsp-srv handle obtained via `GetServiceHandle` might be a different session type than what the game uses internally. On newer firmware, service sessions might need additional initialization (domain conversion, etc.) before accepting CMIF.
+fsp-srv requires `SetCurrentProcess` (cmd 1) with PID right after session creation. This is the standard initialization protocol for fsp-srv. Even if the session is connected, fsp-srv rejects commands without this handshake.
 
-**Test:** Use BN to trace how the game's own fsp-srv calls set up and use IPC. Look at xrefs to sub_14bb90 to see how legitimate callers prepare buffers.
+**BUT:** This is a chicken-and-egg problem — we can't send SetCurrentProcess if the kernel rejects the IPC before it reaches fsp-srv. This hypothesis only matters AFTER the kernel-level issue (0xF601) is resolved.
 
-### Hypothesis C: CMIF Needs TIPC Wrapping
+**Test (if kernel issue resolves):** Send CMIF cmd=1 with has_special_header=1, has_pid=1 before any other fsp-srv command.
 
-On this firmware, ALL service IPC might need the new TIPC format. The SM examples prove TIPC works (type=0x10+cmd). fsp-srv might need TIPC-wrapped CMIF or pure TIPC.
+### Hypothesis C: Memory Attributes (SVC #0x22 only)
 
-**Test:** Try sending TIPC format (type=0x10+cmd) to fsp-srv directly, with the CMIF command ID in the TIPC type field.
+`malloc` returns memory from nn::mem's allocator. The kernel might require specific memory attributes (set via svcSetMemoryAttribute) for SVC #0x22 user buffers.
+
+**Test:** Call `svcQueryMemory` on malloc'd buffer vs TLS memory, compare type/permissions/attributes. Find the SDK's page allocator (nn::os::AllocateMemoryPages).
+
+Note: This doesn't explain why SVC #0x21 (TLS) also fails — TLS memory should always have correct attributes.
 
 ### Hypothesis D: Domain Session Required
 
-The game's fsp-srv session might be a domain session (ConvertCurrentObjectToDomain was called). New handles from GetServiceHandle are plain sessions. Need to check if fsp-srv requires domain-mode IPC.
+fsp-srv might require domain mode. The game's fsp-srv session likely had `ConvertCurrentObjectToDomain` called on it. New sessions from GetServiceHandle are plain sessions.
 
-**Test:** Look for `ConvertCurrentObjectToDomain` in BN, check if it's called on the fsp-srv handle path.
+**Test:** Find `ConvertCurrentObjectToDomain` in BN, check if the game calls it on the fsp-srv handle path.
 
-### Hypothesis E: Use the Game's Existing fsp-srv Handle
+### Hypothesis E: Session Acceptance Race
 
-Instead of getting a new handle, find the game's already-initialized fsp-srv session in memory. The game already does FS operations through it. Brute-force handles 1-64 sending CMIF GetGlobalAccessLogMode (cmd 1006) — only fsp-srv would respond with SFCO.
+GetServiceHandle returns before fsp-srv accepts the session on its server port. Adding a delay (or retry loop) between GetServiceHandle and the first IPC send might fix the timing issue.
 
-**Test:** Already attempted in stage3_fspsrv_overflow.lua (Method 3). But that used SVC #0x21 which fails for CMIF. Try the same scan but via SVC #0x22 with proper buffer.
+**Test:** Add `os.execute("sleep 1")` (or a busy-loop) between GetServiceHandle and the first IPC call. Or retry the send 10 times with small delays.
 
 ### Alternative Path: civswitch-kit Techniques
 
 civswitch-kit (different game, same console) successfully does IPC:
-- Uses SDK's `getService` at offset 0x140510 (their SDK)
+- Uses SDK's `getService` at offset 0x140510 (their SDK) — might do more initialization than bare GetServiceHandle
 - Uses SVC #0x22 directly for CMIF
 - Allocates page-aligned memory and verifies with `svcQueryMemory`
 - Key difference: their `allocate` function ensures memory has proper attributes
 
-Porting their approach requires finding our SDK's equivalent `allocate` function.
+Porting their approach requires finding our SDK's equivalent functions. Focus on what `getService` does beyond what `GetServiceHandle` does.
 
 ### Nuclear Option: Bundled Library CVEs
 
