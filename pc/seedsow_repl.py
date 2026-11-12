@@ -16,6 +16,9 @@ Commands:
   test-svc22         Direct SVC #0x22 test (bypass SDK wrapper)
   test-tipc          TIPC format test + memory attribute check
   clean-test         Comprehensive IPC test (clean bytes, handle cleanup)
+  test-type6         CMIF type=6 (RequestWithContext) + PID — matches game's own IPC
+  scan-handles       Brute-force scan all process handles for active sessions
+  scan-bss           Scan SDK BSS for handle-like u32 values
   fsp-init <handle>  Initialize fsp-srv with SetCurrentProcess
   fsp-probe <handle> Probe fsp-srv IPC commands
   full               Full chain: get handle → init → probe
@@ -34,12 +37,15 @@ RECV_TIMEOUT = 30
 OFF_READ_GADGET        = 0x1371f0
 OFF_GET_TLS_BUF        = 0x14ba80
 OFF_GET_SERVICE_HANDLE = 0x14cc90
-OFF_SVC_SEND           = 0x168c4c
-OFF_SVC_SEND_USERBUF   = 0x168c54
-OFF_SDK_SEND_WRAPPER   = 0x14ba90
-OFF_SVC_CLOSE          = 0x168be4
+OFF_SVC_SEND           = 0x168c4c   # svcSendSyncRequest (SVC #0x21)
+OFF_SVC_SEND_USERBUF   = 0x168c54   # svcSendSyncRequestWithUserBuffer (SVC #0x22)
+OFF_SDK_SEND_WRAPPER   = 0x14ba90   # ipc::SendSyncRequestWrapper
+OFF_SVC_CLOSE          = 0x168be4   # svcCloseHandle (SVC #0x16)
+OFF_SVC_QUERY_MEM      = 0x168b0c   # svcQueryMemory (SVC #0x6)
+OFF_POSIX_MEMALIGN     = 0x512f40   # posix_memalign (confirmed in BN)
 OFF_SM_HANDLE          = 0xb5459c
 OFF_SM_COUNT           = 0xb54598
+OFF_UNK_SVC_HANDLE     = 0xb544a8   # handle used by ipc_SendRequestOneWord/2MapBufs (socket?)
 OFF_MEMCPY_PLT         = 0x262480   # in main exe
 OFF_MALLOC             = 0x262160
 OFF_FREE               = 0x2621b0
@@ -285,14 +291,10 @@ class SeedREPL:
 
     def fsp_init(self, fsp_handle):
         print(f"\n=== fsp-srv SetCurrentProcess (handle=0x{fsp_handle:x}) ===")
-        pkt = bytearray(64)
-        struct.pack_into('<I', pkt, 0, 0x00000004)
-        struct.pack_into('<I', pkt, 4, 0x80000008)
-        struct.pack_into('<I', pkt, 8, 0x00000001)
-        off = 32
-        pkt[off:off+4] = b'SFCI'
-        struct.pack_into('<I', pkt, off + 8, 1)
-        return self.send_ipc(fsp_handle, bytes(pkt[:off + 16]), "SetCurrentProcess")
+        # Use CMIF type=6 (RequestWithContext) with PID — matches the game's format
+        pkt = build_cmif_type6_setcurrentprocess()
+        print(f"  Packet ({len(pkt)}B, type=6 w/ PID): {pkt.hex()}")
+        return self.send_ipc(fsp_handle, pkt, "SetCurrentProcess (type=6)")
 
     def fsp_probe(self, fsp_handle):
         print(f"\n=== Probing fsp-srv (handle=0x{fsp_handle:x}) ===")
@@ -375,6 +377,60 @@ def build_tipc_packet(cmd_id, input_data=b''):
     if input_data:
         pkt[8:8+len(input_data)] = input_data
     return bytes(pkt)
+
+
+def build_cmif_type6_packet(cmd_id, input_data=b'', has_pid=True):
+    """CMIF type=6 (RequestWithContext) — the format the game actually uses.
+    Includes special header with PID flag (kernel fills in the PID).
+    Layout: word0(type=6) | word1(data_size,has_special) | special_hdr | pid(8B,kernel-filled) | SFCI"""
+    sfci_len = 16 + len(input_data)  # SFCI magic(4) + version(4) + cmd_id(4) + reserved(4) + input
+    if has_pid:
+        # special header(4B) + pid_placeholder(8B) + padding_to_16align + SFCI
+        special_hdr_size = 4  # 1 word
+        pid_size = 8
+        pre_sfci = special_hdr_size + pid_size
+        # Align SFCI to 16 bytes from start of raw data section
+        sfci_offset_in_data = (pre_sfci + 15) & ~15
+        total_data_bytes = sfci_offset_in_data + sfci_len
+    else:
+        sfci_offset_in_data = 0
+        total_data_bytes = sfci_len
+
+    data_words = (total_data_bytes + 3) // 4
+
+    pkt = bytearray(8 + total_data_bytes)
+    # HIPC header word 0: type=6, no descriptors
+    struct.pack_into('<I', pkt, 0, 0x00000006)
+    # HIPC header word 1: data_size + has_special_header bit
+    word1 = data_words
+    if has_pid:
+        word1 |= 0x80000000  # bit 31 = has special header
+    struct.pack_into('<I', pkt, 4, word1)
+
+    if has_pid:
+        # Special header at offset 8: bit 0 = has_pid
+        struct.pack_into('<I', pkt, 8, 0x00000001)
+        # Offset 12-19: PID (kernel fills this in)
+        # SFCI starts after alignment
+        sfci_off = 8 + sfci_offset_in_data
+    else:
+        sfci_off = 8
+
+    # SFCI header
+    pkt[sfci_off:sfci_off+4] = b'SFCI'
+    struct.pack_into('<I', pkt, sfci_off + 4, 1)  # version = 1 (game uses this)
+    struct.pack_into('<I', pkt, sfci_off + 8, cmd_id)
+    # offset +12: reserved = 0
+    if input_data:
+        pkt[sfci_off+16:sfci_off+16+len(input_data)] = input_data
+
+    return bytes(pkt)
+
+
+def build_cmif_type6_setcurrentprocess():
+    """Build SetCurrentProcess (cmd=1) with CMIF type=6 + PID.
+    This is the first command civswitch sends to fsp-srv after GetServiceHandle."""
+    return build_cmif_type6_packet(1, has_pid=True)
 
 
 def main():
@@ -673,6 +729,243 @@ def main():
                 f'return string.format("close(fsp-srv)=0x%x", rc)'
             )
             print(f"  {resp}")
+
+    elif command == 'test-type6':
+        # Test CMIF type=6 (RequestWithContext) — matches the game's own IPC format
+        memcpy = repl.main_base + OFF_MEMCPY_PLT
+        svc21 = repl.sdk_base + OFF_SVC_SEND
+        sdk_wrap = repl.sdk_base + OFF_SDK_SEND_WRAPPER
+        get_svc = repl.sdk_base + OFF_GET_SERVICE_HANDLE
+        svc_close = repl.sdk_base + OFF_SVC_CLOSE
+
+        print("\n=== CMIF Type=6 (RequestWithContext) Test ===")
+        print("This is the exact IPC format the game uses (confirmed via BN decompile).")
+
+        handle = repl.sdk_get_service('fsp-srv')
+        if not handle:
+            print("[-] GetServiceHandle failed")
+        else:
+            print(f"[+] fsp-srv handle: 0x{handle:x}")
+
+            def send_atomic_type6(handle_val, pkt_bytes, label):
+                lua_hdr = bytes_to_lua_str(pkt_bytes)
+                try:
+                    resp = repl.cmd(
+                        f'local ps = {lua_hdr} .. string.rep("\\0", {256 - len(pkt_bytes)}) '
+                        f'local pa = h.str_addr(ps) + 24 '
+                        f'_G.rd = h.alloc(256) for i=0,248,8 do h.poke(rd+i,0) end '
+                        f'h.run_chain(function(E) '
+                        f'  E:call3(0x{memcpy:x}, tls, pa, 256) '
+                        f'  E:call3(0x{svc21:x}, {handle_val}, 0, 0) '
+                        f'  E:call3(0x{memcpy:x}, rd, tls, 256) '
+                        f'end) '
+                        f'return "done"',
+                        timeout=30
+                    )
+                    # Read result from chain — check x0 of svc21 call
+                    r2 = repl.cmd(
+                        f'local s=string.rep("\\0",64) local d=h.str_addr(s)+24 '
+                        f'h.call_deep(0x{memcpy:x}, d, rd, 64, 0, 0) '
+                        f'local b={{}} for i=1,40 do b[#b+1]=string.format("%02x",string.byte(s,i)) end '
+                        f'h.free(rd) return table.concat(b," ")'
+                    )
+                    print(f"  [{label}] resp: {r2}")
+                    return r2
+                except Exception as e:
+                    print(f"  [{label}] Error: {e}")
+                    return None
+
+            # Test 1: Type=6 SetCurrentProcess (cmd=1) with PID
+            print("\n--- Test 1: Type=6 SetCurrentProcess (cmd=1, PID) ---")
+            pkt = build_cmif_type6_setcurrentprocess()
+            print(f"  Packet ({len(pkt)}B): {pkt.hex()}")
+            send_atomic_type6(handle, pkt, "SetCurrentProcess type=6")
+
+            # Test 2: Type=6 IsSdCardAccessible (cmd=1001) with PID
+            print("\n--- Test 2: Type=6 IsSdCardAccessible (cmd=1001, PID) ---")
+            pkt = build_cmif_type6_packet(1001, has_pid=True)
+            print(f"  Packet ({len(pkt)}B): {pkt.hex()}")
+            send_atomic_type6(handle, pkt, "IsSdCardAccessible type=6")
+
+            # Test 3: Type=6 without PID (for comparison)
+            print("\n--- Test 3: Type=6 IsSdCardAccessible (cmd=1001, no PID) ---")
+            pkt = build_cmif_type6_packet(1001, has_pid=False)
+            print(f"  Packet ({len(pkt)}B): {pkt.hex()}")
+            send_atomic_type6(handle, pkt, "IsSdCardAccessible type=6 noPID")
+
+            # Test 4: Also try via SDK wrapper (SVC#22 path)
+            print("\n--- Test 4: Type=6 SetCurrentProcess via SDK wrapper ---")
+            pkt = build_cmif_type6_setcurrentprocess()
+            print(f"  Packet ({len(pkt)}B): {pkt.hex()}")
+            resp = repl.cmd(
+                f'local ps = {bytes_to_lua_str(pkt)} .. string.rep("\\0", {4096 - len(pkt)}) '
+                f'local pa = h.str_addr(ps) + 24 '
+                f'local raw = h.alloc(0x2000) '
+                f'local ab = raw if raw%0x1000~=0 then ab=raw+0x1000-(raw%0x1000) end '
+                f'h.call_deep(0x{memcpy:x}, ab, pa, 4096, 0, 0) '
+                f'local rc = h.call_deep(0x{sdk_wrap:x}, {handle}, ab, 4096, 0, 0) '
+                f'h.free(raw) '
+                f'return string.format("rc=0x%x", rc)',
+                timeout=30
+            )
+            print(f"  SDK wrapper result: {resp}")
+
+            # Cleanup
+            resp = repl.cmd(
+                f'local rc = h.call_deep(0x{svc_close:x}, 0x{handle:x}, 0, 0, 0, 0) '
+                f'return string.format("close=0x%x", rc)'
+            )
+            print(f"\n  Cleanup: {resp}")
+
+    elif command == 'scan-handles':
+        # Brute-force scan for active session handles using SDK wrapper
+        # SDK wrapper returns the SVC result directly (0xF601→0x25a0b, 0xE401→0x1c80a, 0→0)
+        memcpy = repl.main_base + OFF_MEMCPY_PLT
+        sdk_wrap = repl.sdk_base + OFF_SDK_SEND_WRAPPER
+        svc_close = repl.sdk_base + OFF_SVC_CLOSE
+
+        max_handle = int(service, 0) if service != 'fsp-srv' else 0x400
+
+        print(f"\n=== Handle Scanner (0x1 to 0x{max_handle:x}) ===")
+        print("Testing each handle via SDK wrapper (sends CMIF type=6, PID).")
+        print("SDK error codes: 0=SUCCESS, 0x25a0b=InvalidState(0xf601), 0x1c80a=InvalidHandle(0xe401)\n")
+
+        # Build a minimal CMIF type=6 request
+        probe_pkt = build_cmif_type6_packet(0, has_pid=True)
+        lua_probe = bytes_to_lua_str(probe_pkt)
+
+        found_handles = []
+
+        # Pre-allocate the probe buffer once
+        repl.cmd(
+            f'_G.scan_pkt = {lua_probe} .. string.rep("\\0", {4096 - len(probe_pkt)}) '
+            f'_G.scan_src = h.str_addr(scan_pkt) + 24 '
+            f'_G.scan_buf_raw = h.alloc(0x2000) '
+            f'_G.scan_buf = scan_buf_raw '
+            f'if scan_buf_raw%0x1000~=0 then scan_buf=scan_buf_raw+0x1000-(scan_buf_raw%0x1000) end '
+            f'return string.format("buf=0x%x", scan_buf)'
+        )
+
+        batch_size = 8
+        for base in range(0, max_handle, batch_size):
+            handles_in_batch = []
+            for i in range(batch_size):
+                h_val = base + i + 1
+                if h_val > max_handle:
+                    break
+                handles_in_batch.append(h_val)
+
+            if not handles_in_batch:
+                break
+
+            handles_str = ','.join(str(h) for h in handles_in_batch)
+            try:
+                resp = repl.cmd(
+                    f'local hs={{{handles_str}}} '
+                    f'local r={{}} '
+                    f'for _,hv in ipairs(hs) do '
+                    f'  h.call_deep(0x{memcpy:x}, scan_buf, scan_src, 256, 0, 0) '
+                    f'  local rc = h.call_deep(0x{sdk_wrap:x}, hv, scan_buf, 4096, 0, 0) '
+                    f'  if rc == nil then rc = -1 end '
+                    f'  r[#r+1]=string.format("%x:%x",hv,rc) '
+                    f'end '
+                    f'return table.concat(r, " ")',
+                    timeout=60
+                )
+
+                for pair in resp.split():
+                    if ':' in pair:
+                        parts = pair.split(':')
+                        h_val = int(parts[0], 16)
+                        rc_val = int(parts[1], 16)
+
+                        # 0x1c80a = SDK translation of kernel 0xe401 (InvalidHandle)
+                        if rc_val != 0x1c80a:
+                            if rc_val == 0:
+                                status = "SUCCESS!"
+                            elif rc_val == 0x25a0b:
+                                status = "InvalidState (new handle, not accepted)"
+                            else:
+                                status = f"0x{rc_val:x} (service rejected command)"
+                            print(f"  handle 0x{h_val:04x}: {status}")
+                            found_handles.append((h_val, rc_val))
+
+            except Exception as e:
+                print(f"  [!] Error at batch 0x{base:x}: {e}")
+                continue
+
+            if (base + batch_size) % 256 == 0:
+                print(f"  ... scanned up to 0x{base + batch_size:x}")
+
+        # Cleanup scan buffer
+        repl.cmd('h.free(scan_buf_raw)')
+
+        print(f"\n=== Scan complete: {len(found_handles)} active handles found ===")
+        for h_val, rc in found_handles:
+            if rc == 0:
+                status = "SUCCESS — active session accepting IPC!"
+            elif rc == 0x25a0b:
+                status = "InvalidState"
+            else:
+                status = f"error 0x{rc:x}"
+            print(f"  0x{h_val:04x}: {status}")
+
+        success_handles = [h for h, rc in found_handles if rc == 0]
+        if success_handles:
+            print(f"\n[!!] Found {len(success_handles)} active sessions! Try IPC on these:")
+            for h_val in success_handles:
+                print(f"  python3 seedsow_repl.py {repl.host} fsp-probe 0x{h_val:x}")
+
+    elif command == 'scan-bss':
+        # Scan SDK BSS section for handle-like u32 values
+        print("\n=== SDK BSS Handle Scan ===")
+        print("Reading u32 values from SDK BSS around the known handle area...")
+
+        # BSS area: SDK offsets 0xb54000 to 0xb56000
+        # Known handles: SM at 0xb5459c, unknown at 0xb544a8
+        bss_start = 0xb54000
+        bss_end = 0xb56000
+        step = 4  # read every u32
+
+        print(f"\n  Scanning SDK+0x{bss_start:x} to SDK+0x{bss_end:x}")
+        handles_found = []
+
+        for off in range(bss_start, bss_end, 64):
+            # Read 8 qwords (64 bytes) at a time
+            try:
+                resp = repl.cmd(
+                    f'local b={{}} '
+                    f'for i=0,56,8 do '
+                    f'  b[#b+1]=string.format("%016x", read8(SDK + 0x{off:x} + i)) '
+                    f'end '
+                    f'return table.concat(b," ")'
+                )
+                words = resp.split()
+                for i, w in enumerate(words):
+                    val = int(w, 16)
+                    lo = val & 0xFFFFFFFF
+                    hi = (val >> 32) & 0xFFFFFFFF
+                    addr = off + i * 8
+                    # Check for handle-like values (non-zero, reasonable range)
+                    for half, half_off in [(lo, addr), (hi, addr + 4)]:
+                        if half != 0 and half < 0x10000 and half not in (1, 2, 3, 4):
+                            handles_found.append((half_off, half))
+            except Exception as e:
+                pass
+
+        print(f"\n  Found {len(handles_found)} handle-like u32 values:")
+        for addr, val in handles_found:
+            label = ""
+            if addr == 0xb5459c:
+                label = " ← SM handle"
+            elif addr == 0xb54598:
+                label = " ← SM init count"
+            elif addr == 0xb544a8:
+                label = " ← ipc_SendRequest* handle (socket?)"
+            print(f"    SDK+0x{addr:x}: 0x{val:04x}{label}")
+
+        if handles_found:
+            print("\n[*] Try: scan-handles to test which of these are valid sessions")
 
     elif command == 'fsp-init':
         fsp_handle = int(service, 0)

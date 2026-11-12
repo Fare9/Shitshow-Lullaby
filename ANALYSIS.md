@@ -281,6 +281,27 @@ The kernel rejects the message before it reaches the fsp-srv service process. Re
 
 Since we tested three completely different header formats (CMIF aligned, CMIF compact, TIPC) and all fail identically, option 3 is unlikely. **The session itself is in an invalid state.**
 
+### BN Analysis Discovery: Game Uses CMIF Type=6, Not Type=4
+
+Binary Ninja analysis of the main binary revealed that all IPC client methods use **CMIF type=6 (RequestWithContext)**, NOT type=4 (Request). The game's CMIF messages:
+
+```
+HIPC header:
+  word 0: 0x00000006       — type=6 (RequestWithContext)
+  word 1: 0x8000XXXX       — bit 31 = has special header, bits 0-9 = data words
+Special header:
+  word 2: 0x00000001       — has_pid = 1 (kernel fills in process PID)
+PID (kernel):
+  word 3-4: <kernel writes PID here>
+SFCI:
+  aligned to 16B boundary
+  magic: 0x49434653        — "SFCI" (LE)
+  version: 1               — not 0 like standard, game uses version 1
+  cmd_id: <command>
+```
+
+This is a different format from what we tested. We sent type=4 (Request) with version=0. The game also sets SFCI version to 1, not 0. Added `test-type6` and `build_cmif_type6_packet()` to test this.
+
 ### Why the session might be broken
 
 When we call GetServiceHandle("fsp-srv"), SM creates a session pair and returns our client handle. But fsp-srv must **accept** the session on its server port. If fsp-srv:
@@ -298,11 +319,21 @@ When we call GetServiceHandle("fsp-srv"), SM creates a session pair and returns 
 
 The game already has an initialized, working fsp-srv session (it loads saves, processes assets, etc.). Instead of obtaining a new session that might be rejected, **find and reuse the game's existing fsp-srv handle**.
 
+**IMPORTANT:** BN analysis shows the nn::fs library uses nn::sf (service framework) which stores session handles in heap-allocated proxy objects, NOT directly in BSS. The BSS may only have a pointer to the proxy. The game uses domain sessions (ConvertCurrentObjectToDomain), so the fsp-srv handle is a domain session handle.
+
+Two new REPL commands for hardware testing:
+- `scan-handles [max]` — brute-force test every handle 1-max with the SDK wrapper. Reports which handles are active sessions (SUCCESS), which are InvalidState (new/unaccepted), and which are InvalidHandle (non-existent). **This will find ALL working sessions in the process.**
+- `scan-bss` — read u32 values from SDK BSS around the known handle area (0xb54000-0xb56000) to find handle-like values
+
+Known handles from BN:
+- SM: SDK+0xb5459c
+- Unknown service (socket?): SDK+0xb544a8 (used by ipc_SendRequestOneWord/2MapBuffers)
+
 Approaches:
-1. **Scan BSS/data** for stored handle values — the SDK stores IFS* client handles in globals
-2. **Handle brute-force** — iterate handles 1-64, for each: try svcGetInfo or check handle type via kernel
-3. **Trace xrefs** in BN — follow nn::fs initialization to find where the fsp-srv handle is stored
-4. **Read the game's IPC client objects** in memory — SDK IPC client structs contain the handle at a known offset
+1. **scan-handles** — brute-force ALL handles. Handles returning SUCCESS are active sessions. Try fsp-probe on each.
+2. **scan-bss** — find handle-like u32 values in SDK BSS, then test them
+3. **Trace nn::fs proxy objects** in memory — if scan-handles finds working sessions, compare the handle values with the BSS scan to identify which service each handle belongs to
+4. **Use type=6 IPC** on found handles — the game uses CMIF type=6 (RequestWithContext) with PID, not type=4
 
 ### Hypothesis B: SetCurrentProcess Initialization
 
@@ -335,12 +366,15 @@ GetServiceHandle returns before fsp-srv accepts the session on its server port. 
 ### Alternative Path: civswitch-kit Techniques
 
 civswitch-kit (different game, same console) successfully does IPC:
-- Uses SDK's `getService` at offset 0x140510 (their SDK) — might do more initialization than bare GetServiceHandle
-- Uses SVC #0x22 directly for CMIF
-- Allocates page-aligned memory and verifies with `svcQueryMemory`
-- Key difference: their `allocate` function ensures memory has proper attributes
+- Uses SDK's `getService` which IS `sm::GetServiceHandle` (SDK+0x14CC90) — **same function, confirmed via BN**
+- Uses `posix_memalign` (confirmed at SDK+0x512F40) for page-aligned IPC buffers
+- Full init chain: GetServiceHandle → SetCurrentProcess(cmd=1, PID) → ConvertCurrentObjectToDomain(HIPC type=5)
+- Uses domain-mode commands for actual FS operations after conversion
 
-Porting their approach requires finding our SDK's equivalent functions. Focus on what `getService` does beyond what `GetServiceHandle` does.
+Since their getService is the same function, the difference must be in what happens AFTER:
+1. civswitch immediately sends SetCurrentProcess with PID — maybe fsp-srv accepts faster when it sees the PID handshake?
+2. civswitch uses posix_memalign, not malloc — maybe buffer alignment matters for kernel validation?
+3. civswitch does all IPC atomically in C, not through Lua REPL round-trips — eliminates any timing issues
 
 ### Nuclear Option: Bundled Library CVEs
 
@@ -358,19 +392,61 @@ These would need to be triggered through engine commands that process attacker-c
 
 All offsets are relative to SDK NSO base. BN address = runtime offset + 0x100.
 
+### SM and IPC
 ```
-nn::sm::detail::GetServiceHandle    0x14cc90
-nn::sm::detail::Initialize          0x14cb20
-SDK IPC send wrapper                0x14ba90
-MRS TPIDRRO_EL0; RET                0x14ba80
-SVC #0x21 (svcSendSyncRequest)      0x168c4c
-SVC #0x22 (svcSendSyncRequestUB)    0x168c54
-SVC #0x16 (svcCloseHandle)          0x168be4
-SVC #0x29 (svcGetInfo)              0x168ca4
-SM handle (.bss)                    0xb5459c
-SM init count (.bss)                0xb54598
-nn::fs::CommitSaveData              0x0a7f70
+sm::Initialize                      0x14cb20   (TIPC cmd 0x10 to SM)
+sm::GetServiceHandle                0x14cc90   (TIPC cmd 0x11 to SM)
+sm::RegisterService                 0x14ce00
+sm::UnregisterService               0x14cf84
+ipc::SendSyncRequestWrapper         0x14ba90   (TLS→SVC#21, heap→SVC#22; 0xF601→0x25a0b)
+ipc::CloseHandleOrPanic             0x14ba50
+ipc::ObjectManagerDispatch          0x14bbd0   (vtable-based dispatch)
+ipc::CreateSession                  0x14bc90
+ipc::CloseSession                   0x14d0d8
+ipc::SendRequestWith2MapBuffers     0x14d1f0   (TIPC cmd 0, 2 A-desc, handle@0xb544a8)
+ipc::SendRequestOneWord             0x14d2a0   (TIPC cmd 1, 1 data word, handle@0xb544a8)
+GetTlsBuffer (MRS TPIDRRO_EL0;RET) 0x14ba80
+```
+
+### SVC Stubs (all confirmed via BN, runtime offsets)
+```
+svcSetHeapSize                      0x168ad4
+svcSetMemoryPermission              0x168aec
+svcSetMemoryAttribute               0x168af4
+svcMapMemory                        0x168afc
+svcUnmapMemory                      0x168b04
+svcQueryMemory                      0x168b0c   ← for checking buffer attributes
+svcExitProcess                      0x168b24
+svcCreateThread                     0x168b2c
+svcStartThread                      0x168b44
+svcSendSyncRequest                  0x168c4c   (SVC #0x21)
+svcSendSyncRequestWithUserBuffer    0x168c54   (SVC #0x22 — DEAD CODE in SDK)
+svcGetThreadId                      0x168c74
+svcCloseHandle                      0x168be4
+svcResetSignal                      0x168bec
+svcWaitSynchronization              0x168bf4
+svcConnectToNamedPort               0x168c34
+svcGetInfo                          0x168ca4
+svcCreateSession                    0x168d74
+svcAcceptSession                    0x168d94
+```
+
+### Memory Allocation
+```
+posix_memalign                      0x512f40   ← CONFIRMED (alignment checks, EINVAL/ENOMEM)
 nn::os::GetThreadId (read gadget)   0x1371f0
+```
+
+### BSS Globals
+```
+SM handle (u32)                     0xb5459c
+SM init count (u32)                 0xb54598
+Unknown service handle (u32)        0xb544a8   (used by ipc_SendRequest* functions)
+```
+
+### Other
+```
+nn::fs::CommitSaveData              0x0a7f70
 vcall8_restore                      0x3d9e54
 longjmp                             0x5511b4
 nn::socket::* (Initialize, Socket, Bind, Listen, Accept, Recv, Send, Close)
@@ -379,6 +455,79 @@ memcpy (main PLT)                   0x262480
 malloc (main PLT)                   0x262160
 free (main PLT)                     0x2621b0
 ```
+
+## BN Analysis Key Findings (2026-11-12)
+
+### SDK Uses TIPC Everywhere, Not CMIF
+
+All IPC in the SDK uses **TIPC format** (HIPC type = 0x10 + cmd_id), never CMIF (type = 4). The SM functions, the IPC request builders, everything — all TIPC. This means fsp-srv on this firmware likely speaks TIPC too.
+
+### Main Binary Uses CMIF Type=6 (RequestWithContext)
+
+All CMIF client methods in the main binary (Artemis engine) use **type=6** (RequestWithContext), not type=4 (Request). They all set `has_pid=1` in the special header (kernel auto-fills the PID) and use **SFCI version=1** (not 0).
+
+### SVC#22 Is Dead Code
+
+`svcSendSyncRequestWithUserBuffer` (SVC#22) is called ONLY by `ipc::SendSyncRequestWrapper`, which itself has NO external callers in the SDK. All actual IPC uses SVC#21 (TLS-based). The wrapper exists but is never used internally.
+
+### posix_memalign Confirmed
+
+SDK+0x512F40 is `posix_memalign(void **out, size_t alignment, size_t size)`. Validates alignment ≥ 8 and power-of-2. Returns EINVAL(0x16) or ENOMEM(0x0c). The actual allocation is performed by sub_5eb7b0(alignment, size).
+
+### BSS Handle at 0xb544a8
+
+`ipc_SendRequestOneWord` and `ipc_SendRequestWith2MapBuffers` both use a session handle stored at BSS offset 0xb544a8. This is a different handle than SM (0xb5459c). Likely the socket/bsd service, not fsp-srv. The nn::fs library stores its fsp-srv session handle in heap-allocated nn::sf proxy objects, not directly in BSS.
+
+### BN Annotations Applied
+
+The following symbols, comments, and data variables were defined across both BN databases.
+
+**SDK (sdk.nso.bndb) — functions renamed/defined:**
+
+| BN Address | Runtime Offset | Name | Notes |
+|---|---|---|---|
+| 0x513040 | 0x512F40 | `posix_memalign` | Alignment-checked allocator |
+| 0x14d210 | 0x14d110 | `ipc_InitSessionObject` | Session setup helper |
+| 0x14d2e0 | 0x14d1e0 | `ipc_AbortNoReturn` | Abort/panic stub |
+| 0x0a6810 | 0x0a6710 | `nn_fs_ClientImpl_ProcessRequest` | 92 basic blocks, main FS dispatch |
+| 0x0a7240 | 0x0a7140 | `nn_fs_ClientImpl_CommitSaveData` | 27 basic blocks |
+| 0x0a74f0 | 0x0a73f0 | `nn_fs_ClientImpl_OpenFile` | 88 basic blocks |
+| 0x0a7bd0 | 0x0a7ad0 | `nn_fs_ClientImpl_ReadFile` | 32 basic blocks |
+| 0x0a7ef0 | 0x0a7df0 | `nn_fs_ClientImpl_FlushFile` | 14 basic blocks |
+| 0x5512b4 | 0x5511b4 | `longjmp` | Standard longjmp |
+
+**SDK (sdk.nso.bndb) — BSS data variables defined (uint32_t):**
+
+| BN Address | Runtime Offset | Name | Comment |
+|---|---|---|---|
+| 0xb5469c | 0xb5459c | `g_SmSessionHandle` | SM session handle. Shared with game — DO NOT CLOSE |
+| 0xb54698 | 0xb54598 | `g_SmInitCount` | SM init reference count |
+| 0xb545a8 | 0xb544a8 | `g_SocketServiceHandle` | Used by `ipc_SendRequestOneWord` / `ipc_SendRequestWith2MapBuffers` |
+
+**Main binary (main_decompressed.elf.bndb) — functions renamed/defined:**
+
+| BN Address | Name | Notes |
+|---|---|---|
+| 0x098e58 | `hipc_ParseMessageHeader` | Extracts descriptor counts, data size, special header flags, PID from raw HIPC words |
+| 0x25ff00 | `cmif_RequestWithContext_LargePayload` | Type=6, PID, SFCI ver=1, 22 data words, 6 qwords from arg2 |
+| 0x260220 | `cmif_RequestWithContext_SmallPayload` | Type=6, PID, SFCI ver=1, 14 data words |
+| 0x260a54 | `cmif_RequestWithContext_WithOutputBuf` | Type=6, PID, has output buffer pointer |
+| 0x260df8 | `cmif_RequestWithContext_WithInputBuf` | Type=6, PID, has input buffer |
+
+**Previously renamed by overnight LLM (already present):**
+
+| BN Address | Runtime Offset | Name |
+|---|---|---|
+| 0x14bb90 | 0x14ba90 | `ipc_SendSyncRequestWrapper` |
+| 0x14bbf0 | 0x14baf0 | `ipc_SendAsyncRequest` |
+| 0x14cc20 | 0x14cb20 | `sm_Initialize` |
+| 0x14cd90 | 0x14cc90 | `sm_GetServiceHandle` |
+| 0x14cf00 | 0x14ce00 | `sm_RegisterService` |
+| 0x14d084 | 0x14cf84 | `sm_UnregisterService` |
+| 0x14d1d8 | 0x14d0d8 | `ipc_CloseSession` |
+| 0x14d2f0 | 0x14d1f0 | `ipc_SendRequestWith2MapBuffers` |
+| 0x14d3a0 | 0x14d2a0 | `ipc_SendRequestOneWord` |
+| 0x168bd4–0x168efc | various | All SVC stubs (svcSetHeapSize through svcMapPhysicalMemoryUnsafe) |
 
 ---
 
